@@ -204,8 +204,9 @@ def check_and_unlock_achievements(user_id):
         })
         
     # 2. Art Critic: Left a comment
-    # Count if user has commented on any approved artworks
-    comment_count = artworks_col.count_documents({"comments.userId": user_id})
+    # Read from the user's own commentedArtworks list instead of scanning every
+    # artwork's comments array (which can't be queried server-side).
+    comment_count = len(user.get("commentedArtworks") or [])
     if comment_count > 0 and "ach2" not in unlocked_ids:
         new_achievements.append({
             "id": "ach2",
@@ -241,6 +242,27 @@ def check_and_unlock_achievements(user_id):
     if len(new_achievements) != len(user.get("achievements", [])):
         users_col.update_one({"_id": user_id}, {"$set": {"achievements": new_achievements}})
 
+# --- Lightweight in-memory cache ─────────────────────────────────────────────
+# The public gallery and category list are identical for every anonymous
+# visitor and change rarely, but each request used to re-read Firestore. A short
+# TTL cache collapses a traffic spike into a handful of reads per worker.
+_cache = {}
+_CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "30"))
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and (time.time() - entry[0]) < _CACHE_TTL:
+        return entry[1]
+    return None
+
+def _cache_set(key, value):
+    _cache[key] = (time.time(), value)
+    return value
+
+def _cache_invalidate(*keys):
+    for k in keys:
+        _cache.pop(k, None)
+
 # --- API Endpoints ---
 
 @app.route("/api/health", methods=["GET"])
@@ -250,8 +272,10 @@ def health():
 # 1. Categories Endpoints
 @app.route("/api/categories", methods=["GET"])
 def get_categories():
-    categories = list(categories_col.find())
-    return jsonify([cat["name"] for cat in categories]), 200
+    cached = _cache_get("categories")
+    if cached is None:
+        cached = _cache_set("categories", [cat["name"] for cat in categories_col.find()])
+    return jsonify(cached), 200
 
 @app.route("/api/categories", methods=["POST"])
 @admin_only
@@ -265,6 +289,7 @@ def add_category():
         return jsonify({"error": "Category already exists"}), 400
         
     categories_col.insert_one({"name": name})
+    _cache_invalidate("categories")
     return jsonify({"success": True, "category": name}), 201
 
 @app.route("/api/categories/<name>", methods=["DELETE"])
@@ -273,6 +298,7 @@ def delete_category(name):
     result = categories_col.delete_one({"name": name.strip().lower()})
     if result.deleted_count == 0:
         return jsonify({"error": "Category not found"}), 404
+    _cache_invalidate("categories")
     return jsonify({"success": True}), 200
 
 # 2. Users / Profile Endpoints
@@ -369,6 +395,12 @@ def update_profile():
 # 3. Artwork Endpoints
 @app.route("/api/artworks", methods=["GET"])
 def get_artworks():
+    # Public feed is the same for every visitor — serve it from a short TTL cache
+    # so a burst of traffic doesn't re-scan the approved artworks each request.
+    cached = _cache_get("artworks_public")
+    if cached is not None:
+        return jsonify(cached), 200
+
     # Only return approved artworks for public feed — votes are excluded for regular users
     artworks = list(artworks_col.find({"status": "approved"}).sort("createdAt", -1))
     serialized = serialize_doc(artworks)
@@ -378,6 +410,7 @@ def get_artworks():
         art.pop("votes", None)
         art.pop("voters", None)
 
+    _cache_set("artworks_public", serialized)
     return jsonify(serialized), 200
 
 @app.route("/api/admin/artworks", methods=["GET"])
@@ -500,7 +533,11 @@ def submit_artwork():
 
     result = artworks_col.insert_one(artwork_doc)
     artwork_doc["id"] = str(result.inserted_id)
-    
+
+    # Admin uploads are auto-approved and appear in the public feed immediately
+    if artwork_doc["status"] == "approved":
+        _cache_invalidate("artworks_public")
+
     # Check achievements for submitter
     check_and_unlock_achievements(g.user_id)
     
@@ -586,6 +623,11 @@ def comment_artwork(artwork_id):
         {"_id": artwork_id},
         {"$push": {"comments": comment_doc}}
     )
+    # Track on the user so the "Art Critic" achievement check stays O(1)
+    users_col.update_one(
+        {"_id": g.user_id},
+        {"$push": {"commentedArtworks": artwork_id}}
+    )
 
     # Check achievements
     check_and_unlock_achievements(g.user_id)
@@ -614,6 +656,9 @@ def approve_artwork(artwork_id):
     )
     if result.matched_count == 0:
         return jsonify({"error": "Artwork not found"}), 404
+
+    # New artwork is now public — drop the cached feed
+    _cache_invalidate("artworks_public")
 
     # Trigger achievement checklist updates for the artist of the approved artwork
     artwork = artworks_col.find_one({"_id": artwork_id})
@@ -647,6 +692,9 @@ def reject_artwork(artwork_id):
     result = artworks_col.update_one({"_id": artwork_id}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"error": "Artwork not found"}), 404
+
+    # A rejected artwork may have previously been approved — refresh the feed
+    _cache_invalidate("artworks_public")
 
     # Send rejection notification email to the artist
     artwork = artworks_col.find_one({"_id": artwork_id})
@@ -1277,7 +1325,11 @@ def submit_video_artwork():
         
         # Save to database
         artworks_col.insert_one(artwork_doc)
-        
+
+        # Admin uploads are auto-approved and appear in the public feed immediately
+        if artwork_doc["status"] == "approved":
+            _cache_invalidate("artworks_public")
+
         # Check achievements
         check_and_unlock_achievements(g.user_id)
         

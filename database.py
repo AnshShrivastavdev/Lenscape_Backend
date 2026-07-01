@@ -6,15 +6,21 @@ subset of the PyMongo API the app uses (find_one, find, insert_one,
 update_one, delete_one, count_documents, insert_many, create_index) so the
 rest of the codebase needs almost no changes.
 
-Queries are evaluated in Python after streaming the collection — this keeps
-us free of Firestore composite-index requirements, which is fine for an
-event-scale dataset.
+Simple equality queries (and lookups by document id) are pushed down to
+Firestore as server-side `.where()` / `.count()` queries so we are billed
+only for the documents that actually match — not the whole collection.
+Every query the app issues filters on a single field (status, email,
+userId, artist.id, name) or by _id, so no composite indexes are required.
+Only the rare queries the translator can't express server-side (operator
+dicts like {"$ne": ...}, or matching inside arrays of objects) fall back to
+streaming the collection in Python.
 """
 
 import os
 import json
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
+from google.cloud.firestore_v1.base_query import FieldFilter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -93,6 +99,36 @@ class FirestoreCollection:
         return [self._doc_to_dict(s) for s in self.col.stream()]
 
     @staticmethod
+    def _server_filters(query):
+        """
+        Split a query into (server_side_equality_filters, can_push_down).
+
+        Returns a list of (field_path, value) equality conditions that Firestore
+        can evaluate with `.where()`, and a bool that is False when the query
+        contains something we can't express server-side (operator dicts, or the
+        special comments.userId array match) — in which case the caller must fall
+        back to streaming + Python matching.
+        """
+        filters = []
+        for k, v in query.items():
+            if k == "_id":
+                # handled separately via direct document lookup
+                continue
+            # operator dicts (e.g. {"$ne": ...}) or array-of-object matches
+            # can't be pushed down — bail out to the Python fallback.
+            if isinstance(v, dict) or k == "comments.userId":
+                return filters, False
+            filters.append((k, v))
+        return filters, True
+
+    def _server_query(self, filters):
+        """Build a Firestore query from a list of (field_path, value) equalities."""
+        q = self.col
+        for field, value in filters:
+            q = q.where(filter=FieldFilter(field, "==", value))
+        return q
+
+    @staticmethod
     def _get_field(doc, key):
         cur = doc
         for part in key.split("."):
@@ -131,7 +167,7 @@ class FirestoreCollection:
     # -- read --
     def find_one(self, query=None):
         query = query or {}
-        # fast path: lookup by document id
+        # fast path: lookup by document id (1 read)
         if "_id" in query and isinstance(query["_id"], str):
             snap = self.col.document(query["_id"]).get()
             if not snap.exists:
@@ -139,6 +175,15 @@ class FirestoreCollection:
             doc = self._doc_to_dict(snap)
             rest = {k: v for k, v in query.items() if k != "_id"}
             return doc if self._match(doc, rest) else None
+
+        filters, pushdown = self._server_filters(query)
+        if pushdown and filters:
+            # server-side query — billed only for matching docs
+            for snap in self._server_query(filters).limit(1).stream():
+                return self._doc_to_dict(snap)
+            return None
+
+        # fallback: stream + match in Python (e.g. operator dicts)
         for doc in self._all():
             if self._match(doc, query):
                 return doc
@@ -146,12 +191,21 @@ class FirestoreCollection:
 
     def find(self, query=None):
         query = query or {}
+        filters, pushdown = self._server_filters(query)
+        if pushdown and filters:
+            docs = [self._doc_to_dict(s) for s in self._server_query(filters).stream()]
+            return _Cursor(docs)
         return _Cursor([d for d in self._all() if self._match(d, query)])
 
     def count_documents(self, query=None):
         query = query or {}
-        if not query:
-            return sum(1 for _ in self.col.stream())
+        filters, pushdown = self._server_filters(query)
+        if pushdown:
+            # aggregation count — billed at roughly 1 read per 1000 matched docs
+            q = self._server_query(filters) if filters else self.col
+            result = q.count().get()
+            return int(result[0][0].value)
+        # fallback for queries we can't express server-side
         return len([d for d in self._all() if self._match(d, query)])
 
     # -- write --
